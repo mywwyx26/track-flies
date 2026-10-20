@@ -1,5 +1,4 @@
-import os
-import time
+import os, time
 import numpy as np
 import matplotlib.pyplot as plt
 import tifffile
@@ -7,11 +6,9 @@ from scipy import ndimage
 
 start = time.perf_counter()
 
-file_path = "C:\\Users\\megan\\flies\\comp vision\\_1_MMStack_Default_1051_1150.ome.tif"
-data = tifffile.imread(file_path)
+file_path = "C:\\Users\\megan\\flies\\comp vision\\_1_MMStack_Default.ome.tif"
 output_file = f'output{os.path.basename(file_path)}'
 output_graph = f'output{os.path.basename(file_path)[:-8]}.svg'
-T, H, W = data.shape
 
 # ---------- settings ----------
 THRESH = 128
@@ -22,6 +19,7 @@ MAX_AREA = 25000
 DOT_RADIUS = 4
 FPS = None
 # ------------------------------
+
 
 def disk(r):
     y, x = np.ogrid[-r:r + 1, -r:r + 1]
@@ -60,58 +58,60 @@ def draw_ellipse(rgb, cx, cy, a, b, theta, color=(0, 255, 0)):
             rgb[py, px] = color
 
 open_se, close_se = disk(OPEN_RADIUS), disk(CLOSE_RADIUS)
-
-blurred = ndimage.gaussian_filter(data.astype(np.float32), sigma=(0, 5, 5))
-binary = blurred > THRESH
-
-output = np.zeros((T, H, W), dtype=np.uint8)
-overlay = np.zeros((T, H, W, 3), dtype=np.uint8)
-yy, xx = np.ogrid[:H, :W]
-
-# per-frame measurements (NaN where no fly was found)
 names = ["x", "y", "mu20", "mu02", "mu11", "theta", "a", "b"]
-meas = {k: np.full(T, np.nan) for k in names}
-last = None   # last known (cx, cy, a, b, theta)
+last = None
 
-for i in range(T):
-    m = ndimage.binary_opening(binary[i], structure=open_se)
-    m = ndimage.binary_closing(m, structure=close_se)
-    lab, n = ndimage.label(m)
+with tifffile.TiffFile(file_path, is_mmstack=False, is_ome=False) as tif, \
+     tifffile.TiffWriter(output_file, bigtiff=True) as writer:
 
-    if n:
-        idx = np.arange(1, n + 1)
-        areas = ndimage.sum(m, lab, idx)
-        ok = (areas >= MIN_AREA) & (areas <= MAX_AREA)
-        if ok.any():
-            cand = idx[ok]
-            smallest = cand[np.argmin(areas[ok])]
-            blob = lab == smallest
-            output[i] = blob * 255
-            cx, cy, mu20, mu02, mu11, theta, a, b = blob_moments(blob)
-            for k, v in zip(names, (cx, cy, mu20, mu02, mu11, theta, a, b)):
-                meas[k][i] = v
-            last = (cx, cy, a, b, theta)
+    T = len(tif.pages)
+    H, W = tif.pages[0].shape[:2]
+    print(f"{T} frames, {H}x{W}")
+    meas = {k: np.full(T, np.nan) for k in names}
+    yy, xx = np.ogrid[:H, :W]
 
-    rgb = np.repeat(output[i][..., None], 3, axis=2)
-    if last is not None:                       # keep last known dot + ellipse if fly is lost
-        cx, cy, a, b, theta = last
-        draw_ellipse(rgb, cx, cy, a, b, theta)
-        rgb[(yy - cy)**2 + (xx - cx)**2 <= DOT_RADIUS**2] = (255, 0, 0)
-    overlay[i] = rgb
+    for i in range(T):
+        frame = tif.pages[i].asarray().astype(np.float32)
+        binary = ndimage.gaussian_filter(frame, sigma=5) > THRESH
 
-# orientation: unwrap (axis angle repeats every 180 deg) and flip sign so
-# positive = counterclockwise as seen on screen (image y points down)
+        m = ndimage.binary_opening(binary, structure=open_se)
+        m = ndimage.binary_closing(m, structure=close_se)
+        lab, n = ndimage.label(m)
+
+        mask = np.zeros((H, W), dtype=np.uint8)
+        if n:
+            idx = np.arange(1, n + 1)
+            areas = ndimage.sum(m, lab, idx)
+            ok = (areas >= MIN_AREA) & (areas <= MAX_AREA)
+            if ok.any():
+                smallest = idx[ok][np.argmin(areas[ok])]
+                blob = lab == smallest
+                mask = blob.astype(np.uint8) * 255
+                vals = blob_moments(blob)
+                for k, v in zip(names, vals):
+                    meas[k][i] = v
+                cx, cy, _, _, _, theta, a, b = vals
+                last = (cx, cy, a, b, theta)
+
+        rgb = np.repeat(mask[..., None], 3, axis=2)
+        if last is not None:
+            cx, cy, a, b, theta = last
+            draw_ellipse(rgb, cx, cy, a, b, theta)
+            rgb[(yy - cy)**2 + (xx - cx)**2 <= DOT_RADIUS**2] = (255, 0, 0)
+
+        writer.write(rgb, photometric="rgb", compression="zlib")   # one frame at a time
+
+        if i % 100 == 0:
+            print(f"frame {i}/{T}  ({time.perf_counter() - start:.0f}s)")
+
 theta = meas["theta"]
 valid = ~np.isnan(theta)
 angle_deg = np.full(T, np.nan)
 angle_deg[valid] = -np.degrees(np.unwrap(2 * theta[valid]) / 2)
 
-tifffile.imwrite(output_file, overlay, photometric="rgb")
-
 print(f"fly found in {valid.sum()}/{T} frames")
 print(f'time: {time.perf_counter() - start:.2f} seconds')
 
-# ---------- plot x, y, and rotation over time ----------
 t = np.arange(T) / FPS if FPS else np.arange(T)
 xlabel = "time (s)" if FPS else "frame"
 
